@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 
+	"encoding/json"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
 	"github.com/unrolled/render"
@@ -27,25 +29,42 @@ func initializeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func starsHandler(w http.ResponseWriter, r *http.Request) {
-	keyword := r.FormValue("keyword")
-	rows, err := db.Query(`SELECT * FROM star WHERE keyword = ?`, keyword)
+	var keywords []string
+	json.Unmarshal([]byte(r.FormValue("keyword")), &keywords)
+	//rows, err := db.Query(`SELECT SQL_CACHE * FROM star WHERE keyword = ?`, keyword)
+	rows, err := db.Query(`SELECT * FROM star`)
 	if err != nil && err != sql.ErrNoRows {
 		panicIf(err)
 		return
 	}
 
-	stars := make([]Star, 0, 10)
+	wkt := map[string]bool{}
+	for _, keyword := range keywords {
+		wkt[keyword] = true
+	}
+
+	stars := map[string][]Star{}
 	for rows.Next() {
 		s := Star{}
 		err := rows.Scan(&s.ID, &s.Keyword, &s.UserName, &s.CreatedAt)
 		panicIf(err)
-		stars = append(stars, s)
+		if _, ok := wkt[s.Keyword]; ok {
+			//stars = append(stars, s)
+			stars[s.Keyword] = append(stars[s.Keyword], s)
+		}
 	}
 	rows.Close()
 
-	re.JSON(w, http.StatusOK, map[string][]Star{
-		"result": stars,
-	})
+	bin, _ := json.Marshal(stars)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(bin)
+
+	/*
+		re.JSON(w, http.StatusOK, map[string][]Star{
+			"result": stars,
+		})
+	*/
 }
 
 func starsPostHandler(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +74,7 @@ func starsPostHandler(w http.ResponseWriter, r *http.Request) {
 	if origin == "" {
 		origin = "http://localhost:5000"
 	}
-	u, err := r.URL.Parse(fmt.Sprintf("%s/keyword/%s", origin, pathURIEscape(keyword)))
+	u, err := r.URL.Parse(origin + "/keyword/" + pathURIEscape(keyword))
 	panicIf(err)
 	resp, err := http.Get(u.String())
 	panicIf(err)
@@ -73,6 +92,7 @@ func starsPostHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	runtime.GOMAXPROCS(1)
 	host := os.Getenv("ISUTAR_DB_HOST")
 	if host == "" {
 		host = "localhost"

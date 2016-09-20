@@ -4,11 +4,16 @@ import (
 	"context"
 	"crypto/sha1"
 	"database/sql"
+	"os/signal"
+	"runtime"
+	"runtime/pprof"
+	//"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
 	"html/template"
+	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
@@ -17,11 +22,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	//"time"
 
 	"github.com/Songmu/strrand"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
+	//"github.com/ieee0824/fstring"
 	"github.com/unrolled/render"
 )
 
@@ -29,6 +36,8 @@ const (
 	sessionName   = "isuda_session"
 	sessionSecret = "tonymoris"
 )
+
+var sha1cache = map[string]string{}
 
 var (
 	isutarEndpoint string
@@ -49,7 +58,7 @@ func setName(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	setContext(r, "user_id", userID)
-	row := db.QueryRow(`SELECT name FROM user WHERE id = ?`, userID)
+	row := db.QueryRow(`SELECT SQL_CACHE name FROM user WHERE id = ?`, userID)
 	user := User{}
 	err := row.Scan(&user.Name)
 	if err != nil {
@@ -72,8 +81,12 @@ func authenticate(w http.ResponseWriter, r *http.Request) error {
 func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	_, err := db.Exec(`DELETE FROM entry WHERE id > 7101`)
 	panicIf(err)
+	db.SetMaxIdleConns(8)
+	db.SetMaxOpenConns(2)
 
-	resp, err := http.Get(fmt.Sprintf("%s/initialize", isutarEndpoint))
+	//resp, err := http.Get(fmt.Sprintf("%s/initialize", isutarEndpoint))
+	resp, err := http.Get("http://localhost:5001/initialize")
+	//resp, err := http.Get(isutarEndpoint + "/initialize")
 	panicIf(err)
 	defer resp.Body.Close()
 
@@ -94,25 +107,28 @@ func topHandler(w http.ResponseWriter, r *http.Request) {
 	page, _ := strconv.Atoi(p)
 
 	rows, err := db.Query(fmt.Sprintf(
-		"SELECT * FROM entry ORDER BY updated_at DESC LIMIT %d OFFSET %d",
+		"SELECT SQL_CACHE * FROM entry ORDER BY updated_at DESC LIMIT %d OFFSET %d",
 		perPage, perPage*(page-1),
 	))
+
 	if err != nil && err != sql.ErrNoRows {
 		panicIf(err)
 	}
-	entries := make([]*Entry, 0, 10)
+	entries := make([]*Entry, 0, 128)
 	for rows.Next() {
 		e := Entry{}
 		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
 		panicIf(err)
-		e.Html = htmlify(w, r, e.Description)
-		e.Stars = loadStars(e.Keyword)
 		entries = append(entries, &e)
 	}
+
+	htmlify(w, r, entries)
+	loadStars(entries)
+
 	rows.Close()
 
 	var totalEntries int
-	row := db.QueryRow(`SELECT COUNT(*) FROM entry`)
+	row := db.QueryRow(`SELECT SQL_CACHE COUNT(id) FROM entry`)
 	err = row.Scan(&totalEntries)
 	if err != nil && err != sql.ErrNoRows {
 		panicIf(err)
@@ -189,7 +205,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 func loginPostHandler(w http.ResponseWriter, r *http.Request) {
 	name := r.FormValue("name")
-	row := db.QueryRow(`SELECT * FROM user WHERE name = ?`, name)
+	row := db.QueryRow(`SELECT SQL_CACHE * FROM user WHERE name = ?`, name)
 	user := User{}
 	err := row.Scan(&user.ID, &user.Name, &user.Salt, &user.Password, &user.CreatedAt)
 	if err == sql.ErrNoRows || user.Password != fmt.Sprintf("%x", sha1.Sum([]byte(user.Salt+r.FormValue("password")))) {
@@ -255,15 +271,16 @@ func keywordByKeywordHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	keyword := mux.Vars(r)["keyword"]
-	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
+	row := db.QueryRow(`SELECT SQL_CACHE * FROM entry WHERE keyword = ?`, keyword)
 	e := Entry{}
 	err := row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
 	if err == sql.ErrNoRows {
 		notFound(w)
 		return
 	}
-	e.Html = htmlify(w, r, e.Description)
-	e.Stars = loadStars(e.Keyword)
+	entries := []*Entry{&e}
+	htmlify(w, r, entries)
+	loadStars(entries)
 
 	re.HTML(w, http.StatusOK, "keyword", struct {
 		Context context.Context
@@ -292,7 +309,7 @@ func keywordByKeywordDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
+	row := db.QueryRow(`SELECT SQL_CACHE * FROM entry WHERE keyword = ?`, keyword)
 	e := Entry{}
 	err := row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
 	if err == sql.ErrNoRows {
@@ -304,56 +321,104 @@ func keywordByKeywordDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
-	if content == "" {
-		return ""
+func byteArrayConvertSlice(e [20]byte) []byte {
+	ret := make([]byte, 20)
+	for i := 0; i < 20; i++ {
+		ret[i] = e[i]
 	}
+	return ret
+}
+
+func htmlify(w http.ResponseWriter, r *http.Request, entries []*Entry) {
+
 	rows, err := db.Query(`
-		SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC
-	`)
+			SELECT SQL_CACHE keyword FROM entry ORDER BY keyword DESC
+		`)
 	panicIf(err)
-	entries := make([]*Entry, 0, 500)
+
+	keywords := make([]string, 0, 512)
 	for rows.Next() {
-		e := Entry{}
-		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
+		var keyword string
+		err := rows.Scan(&keyword)
 		panicIf(err)
-		entries = append(entries, &e)
+		keywords = append(keywords, regexp.QuoteMeta(keyword))
+
+		//sha1byte := byteArrayConvertSlice(sha1.Sum([]byte(keyword)))
+		//kw2sha[keyword] = "isuda_" + hex.EncodeToString(sha1byte)
+		//kw2sha[keyword] = "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(keyword)))
+
 	}
 	rows.Close()
 
-	keywords := make([]string, 0, 500)
-	for _, entry := range entries {
-		keywords = append(keywords, regexp.QuoteMeta(entry.Keyword))
+	re := regexp.MustCompile("(" + strings.Join(keywords, "|") + ")")
+	for _, e := range entries {
+		if e.Description == "" {
+			continue
+		}
+
+		//start := time.Now()
+
+		/*
+			for k, v := range kw2sha {
+				if strings.Contains(e.Description, k) {
+					e.Description = strings.Replace(e.Description, k, v, -1)
+				}
+			}
+		*/
+
+		e.Description = html.EscapeString(e.Description)
+		e.Description = re.ReplaceAllStringFunc(e.Description, func(kw string) string {
+			//	return kw2sha[kw]
+			//})
+			//end := time.Now()
+			//fmt.Printf("%f秒\n", (end.Sub(start)).Seconds())
+
+			//for kw, hash := range kw2sha {
+			u, err := r.URL.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(kw))
+			panicIf(err)
+			link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(kw))
+			//link := "<a href=\"" + u + "\">" + html.EscapeString(kw) + "</a>"
+
+			//e.Description = strings.Replace(e.Description, hash, link, -1)
+			//e.Description = strings.Replace(e.Description, kw, link, -1)
+			return link
+		})
+		e.Html = strings.Replace(e.Description, "\n", "<br />\n", -1)
 	}
-	re := regexp.MustCompile("("+strings.Join(keywords, "|")+")")
-	kw2sha := make(map[string]string)
-	content = re.ReplaceAllStringFunc(content, func(kw string) string {
-		kw2sha[kw] = "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(kw)))
-		return kw2sha[kw]
-	})
-	content = html.EscapeString(content)
-	for kw, hash := range kw2sha {
-		u, err := r.URL.Parse(baseUrl.String()+"/keyword/" + pathURIEscape(kw))
-		panicIf(err)
-		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(kw))
-		content = strings.Replace(content, hash, link, -1)
-	}
-	return strings.Replace(content, "\n", "<br />\n", -1)
+
 }
 
-func loadStars(keyword string) []*Star {
+func loadStars(entries []*Entry) {
+	var keywords []string
+	for _, e := range entries {
+		keywords = append(keywords, e.Keyword)
+	}
+
+	bin, _ := json.Marshal(
+		keywords,
+	)
+
 	v := url.Values{}
-	v.Set("keyword", keyword)
+	v.Set("keyword", string(bin))
 	resp, err := http.Get(fmt.Sprintf("%s/stars", isutarEndpoint) + "?" + v.Encode())
 	panicIf(err)
 	defer resp.Body.Close()
 
-	var data struct {
-		Result []*Star `json:result`
+	/*
+		var data struct {
+			Result []*Star `json:result`
+		}
+	*/
+	data, _ := ioutil.ReadAll(resp.Body)
+	//err = json.NewDecoder(resp.Body).Decode(&data)
+	//panicIf(err)
+	results := map[string][]*Star{}
+
+	json.Unmarshal(data, &results)
+
+	for _, e := range entries {
+		e.Stars = results[e.Keyword]
 	}
-	err = json.NewDecoder(resp.Body).Decode(&data)
-	panicIf(err)
-	return data.Result
 }
 
 func isSpamContents(content string) bool {
@@ -390,6 +455,21 @@ func getSession(w http.ResponseWriter, r *http.Request) *sessions.Session {
 }
 
 func main() {
+	runtime.GOMAXPROCS(2)
+	cpuprofile := "/tmp/mycpu.prof"
+	f, _ := os.Create(cpuprofile)
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
+	defer pprof.StopCPUProfile()
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for sig := range c {
+			log.Printf("captured %v, stopping profiler and exiting...", sig)
+			pprof.StopCPUProfile()
+			os.Exit(1)
+		}
+	}()
 	host := os.Getenv("ISUDA_DB_HOST")
 	if host == "" {
 		host = "localhost"
@@ -474,6 +554,6 @@ func main() {
 	k.Methods("GET").HandlerFunc(myHandler(keywordByKeywordHandler))
 	k.Methods("POST").HandlerFunc(myHandler(keywordByKeywordDeleteHandler))
 
-	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./public/")))
+	//	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./public/")))
 	log.Fatal(http.ListenAndServe(":5000", r))
 }

@@ -6,6 +6,7 @@ deps:
 	go get github.com/gorilla/sessions
 	go get github.com/Songmu/strrand
 	go get github.com/unrolled/render
+	go get github.com/umisama/go-regexpcache
 
 isuda: deps
 	go build -o isuda isuda.go type.go util.go
